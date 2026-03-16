@@ -4,7 +4,6 @@ import ReactDOM from 'react-dom/client';
 import {TopLevelFrameworkProps} from '../providers/framework-provider';
 
 const fetchKoenigLexical: DesignSystemAppProps['fetchKoenigLexical'] = async () => {
-    // @ts-expect-error koenig-lexical doesn't currently ship TypeScript declarations.
     return await import('@tryghost/koenig-lexical');
 };
 
