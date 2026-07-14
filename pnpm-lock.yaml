@@ -986,6 +986,9 @@ importers:
       '@tryghost/admin-x-design-system':
         specifier: workspace:*
         version: link:../admin-x-design-system
+      '@tryghost/custom-field-types':
+        specifier: workspace:*
+        version: link:../../packages/custom-field-types
       '@tryghost/shade':
         specifier: workspace:*
         version: link:../shade
