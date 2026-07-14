@@ -152,9 +152,25 @@ describe('Schedules API', function () {
                 .expect(200);
         });
 
-        it('not found', function () {
-            return request
+        it('firing ahead of the scheduled time is a no-op, not an error', async function () {
+            // resources[2] is scheduled 10 minutes out — beyond tolerance. A
+            // scheduler firing early (e.g. holding a stale job for a post that
+            // was rescheduled later) should get a 2xx no-op so it does not retry.
+            const res = await request
                 .put(localUtils.API.getApiQuery(`schedules/posts/${resources[2].id}/?token=${token}`))
+                .expect('Content-Type', /json/)
+                .expect('Cache-Control', testUtils.cacheRules.private)
+                .expect(200);
+
+            assert.deepEqual(res.body.posts, []);
+        });
+
+        it('firing well after the scheduled time without force stays an error', function () {
+            // resources[3] is scheduled 10 minutes in the past. Without a force
+            // flag this is a dropped publish and must surface loudly rather
+            // than being silently skipped. (The force case is covered below.)
+            return request
+                .put(localUtils.API.getApiQuery(`schedules/posts/${resources[3].id}/?token=${token}`))
                 .expect('Content-Type', /json/)
                 .expect('Cache-Control', testUtils.cacheRules.private)
                 .expect(404);
