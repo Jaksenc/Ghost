@@ -76,6 +76,10 @@ module.exports = {
         return require('./members');
     },
 
+    get member_custom_fields() {
+        return require('./member-custom-fields');
+    },
+
     get tiers() {
         return require('./tiers');
     },
