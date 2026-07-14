@@ -37,6 +37,12 @@ export interface Resource {
 export interface UrlOptions {
     absolute?: boolean;
     withSubdirectory?: boolean;
+    // Bulk callers (the sitemap index build) set this: enumeration parity is
+    // covered by the getRoutableResources id-set comparison and per-URL
+    // parity by organic request traffic, so teeing hundreds of thousands of
+    // rows per rebuild would only capture stacks and recompute for nothing.
+    // Dies with compare mode.
+    skipComparison?: boolean;
 }
 
 /**
@@ -61,7 +67,18 @@ export interface EagerUrlService {
     hasFinished(): boolean;
     onRouterAddedType(...args: unknown[]): unknown;
     onRouterUpdated(...args: unknown[]): unknown;
+    resources: {getAllByType(type: string): Array<{data: Record<string, unknown>}>};
 }
+
+/**
+ * On-demand enumeration of the routable rows of a type — the lazy
+ * counterpart of the eager service's in-memory cache. Built by
+ * `createFetchRoutableResources` (routable-resources.js).
+ */
+export type FetchRoutableResources = (
+    type: string,
+    options?: {columns?: string[]}
+) => Promise<Array<Record<string, unknown>>>;
 
 export interface LazyUrlServiceBackend {
     getUrlForResource(resource: Resource, options?: UrlOptions): string;
@@ -79,15 +96,25 @@ export class UrlServiceFacade {
     private urlService: EagerUrlService;
     private lazyUrlService: LazyUrlServiceBackend | null;
     private compare: boolean;
+    private fetchRoutableResources: FetchRoutableResources | null;
+    private enumComparesInFlight: Set<string>;
 
     constructor({
         urlService,
         lazyUrlService = null,
-        compare = false
-    }: {urlService: EagerUrlService; lazyUrlService?: LazyUrlServiceBackend | null; compare?: boolean}) {
+        compare = false,
+        fetchRoutableResources = null
+    }: {
+        urlService: EagerUrlService;
+        lazyUrlService?: LazyUrlServiceBackend | null;
+        compare?: boolean;
+        fetchRoutableResources?: FetchRoutableResources | null;
+    }) {
         this.urlService = urlService;
         this.lazyUrlService = lazyUrlService;
         this.compare = compare;
+        this.fetchRoutableResources = fetchRoutableResources;
+        this.enumComparesInFlight = new Set();
     }
 
     isLazy(): boolean {
@@ -99,6 +126,16 @@ export class UrlServiceFacade {
     }
 
     /**
+     * True when a lazy backend exists at all (lazy or compare mode). The
+     * sitemap keys its invalidation on this: with only the eager service,
+     * its per-URL events keep the index current and nothing needs to
+     * invalidate.
+     */
+    hasLazyBackend(): boolean {
+        return !!this.lazyUrlService;
+    }
+
+    /**
      * The full resource record is required: the lazy backend evaluates NQL
      * filters and applies permalink templates against it.
      */
@@ -107,13 +144,80 @@ export class UrlServiceFacade {
             return this.lazyUrlService!.getUrlForResource(resource, options);
         }
         const url = this.urlService.getUrlByResourceId(resource.id, options);
-        if (this.isComparing()) {
+        if (this.isComparing() && !options?.skipComparison) {
             const context = this._compareContext(resource);
             setImmediate(() => this._compare('getUrlForResource', url,
                 () => this.lazyUrlService!.getUrlForResource(resource, options),
                 context));
         }
         return url;
+    }
+
+    /**
+     * All routable rows of a type. Eager answers from its in-memory cache;
+     * lazy fetches from the database on demand. In compare mode the eager
+     * answer is returned and the lazy fetch runs in the background, with any
+     * id-set divergence logged — counts and id samples only, never row
+     * bodies (a large site has hundreds of thousands).
+     */
+    async getRoutableResources(type: string, options: {columns?: string[]} = {}): Promise<Array<Record<string, unknown>>> {
+        if (this.isLazy()) {
+            if (!this.fetchRoutableResources) {
+                throw new errors.IncorrectUsageError({
+                    message: 'getRoutableResources requires an injected fetchRoutableResources in lazy mode'
+                });
+            }
+            return this.fetchRoutableResources(type, options);
+        }
+
+        // `|| []`: the eager cache keys types lazily, so a read that beats
+        // resource initialisation gets an empty list, not a crash.
+        const eagerRows = (this.urlService.resources.getAllByType(type) || []).map(resource => resource.data);
+
+        // Single-flight per type: rapid invalidation cycles must not stack
+        // concurrent full-table comparison walks.
+        if (this.isComparing() && this.fetchRoutableResources && !this.enumComparesInFlight.has(type)) {
+            this.enumComparesInFlight.add(type);
+            void this._compareRoutableResources(type, options, eagerRows).finally(() => {
+                this.enumComparesInFlight.delete(type);
+            });
+        }
+        return eagerRows;
+    }
+
+    private async _compareRoutableResources(
+        type: string,
+        options: {columns?: string[]},
+        eagerRows: Array<Record<string, unknown>>
+    ): Promise<void> {
+        let lazyRows;
+        try {
+            lazyRows = await this.fetchRoutableResources!(type, options);
+        } catch (err) {
+            this._reportLazyError('getRoutableResources', err as Error, {type});
+            return;
+        }
+
+        const eagerIds = new Set(eagerRows.map(row => row.id));
+        const lazyIds = new Set(lazyRows.map(row => row.id));
+        const missingFromLazy = [...eagerIds].filter(id => !lazyIds.has(id));
+        const extraInLazy = [...lazyIds].filter(id => !eagerIds.has(id));
+
+        if (!missingFromLazy.length && !extraInLazy.length) {
+            return;
+        }
+        this._report(new errors.InternalServerError({
+            message: 'URL service parity mismatch',
+            code: 'LAZY_URL_PARITY_MISMATCH',
+            errorDetails: {
+                method: 'getRoutableResources',
+                type,
+                eagerCount: eagerIds.size,
+                lazyCount: lazyIds.size,
+                missingFromLazy: missingFromLazy.slice(0, 10),
+                extraInLazy: extraInLazy.slice(0, 10)
+            }
+        }));
     }
 
     ownsResource(routerIdentifier: string, resource: Resource): boolean {
