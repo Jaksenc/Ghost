@@ -18,7 +18,6 @@ module.exports = [
                 'plaintext',
                 // @TODO: https://github.com/TryGhost/Ghost/issues/10335
                 // 'page',
-                'status',
                 'codeinjection_head',
                 'codeinjection_foot',
                 'meta_title',

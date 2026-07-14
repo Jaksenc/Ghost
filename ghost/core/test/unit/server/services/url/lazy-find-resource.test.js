@@ -56,7 +56,7 @@ describe('createFindResource', function () {
             assert.deepEqual(result.primary_author, {slug: 'jane'});
         });
 
-        it('strips fields the eager service excludes (body, status, posts_meta)', async function () {
+        it('strips fields the eager service excludes (body, posts_meta) and keeps status like the eager cache', async function () {
             models.Post.findOne.resolves(record({
                 id: 'p1',
                 slug: 'hello',
@@ -74,9 +74,13 @@ describe('createFindResource', function () {
 
             const result = await findResource('posts', {slug: 'hello'});
 
-            for (const key of ['title', 'html', 'mobiledoc', 'lexical', 'plaintext', 'status', 'comment_id', 'posts_meta']) {
+            for (const key of ['title', 'html', 'mobiledoc', 'lexical', 'plaintext', 'comment_id', 'posts_meta']) {
                 assert.equal(key in result, false, `${key} should be stripped`);
             }
+            // The strip list derives from the eager resource config, which
+            // keeps status on posts so the compare tee can evaluate the lazy
+            // base filter against cached rows.
+            assert.equal(result.status, 'published');
             assert.equal(result.featured, false);
             assert.equal(result.visibility, 'public');
         });
