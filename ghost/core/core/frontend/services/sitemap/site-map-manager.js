@@ -1,4 +1,5 @@
 const DomainEvents = require('@tryghost/domain-events');
+const errors = require('@tryghost/errors');
 const {URLResourceUpdatedEvent} = require('../../../shared/events');
 const IndexMapGenerator = require('./site-map-index-generator');
 const PagesMapGenerator = require('./page-map-generator');
@@ -8,6 +9,19 @@ const TagsMapGenerator = require('./tags-map-generator');
 
 // This uses events from the routing service and the URL service
 const events = require('../../../server/lib/common/events');
+
+// What the sitemap XML reads off each resource, beyond the columns URL
+// computation needs: lastmod dates, image nodes, and the canonical_url skip
+// rule applied by the generators.
+const SITEMAP_COLUMNS = [
+    'updated_at',
+    'published_at',
+    'created_at',
+    'feature_image',
+    'cover_image',
+    'profile_image',
+    'canonical_url'
+];
 
 class SiteMapManager {
     constructor(options) {
@@ -21,6 +35,23 @@ class SiteMapManager {
         this.tags = options.tags || this.createTagsGenerator(options);
         this.index = options.index || this.createIndexGenerator(options);
 
+        // The URL service is injectable for tests; in production it is
+        // resolved lazily through the proxy seam on first use, because the
+        // url service loads at require time and loading it when this module
+        // loads would change boot order.
+        this._urlService = options.urlService || null;
+
+        // Index state for the build path. _indexEpoch increments on every
+        // invalidation signal; a build compares the epoch it started with so
+        // an invalidated-while-running build never marks the index ready.
+        this._indexBuilt = false;
+        this._buildInFlight = null;
+        this._indexEpoch = 0;
+        // Static/collection route entries only arrive via router.created,
+        // which fires at boot and routes reload. They are recorded here so
+        // every rebuild can replay them after resetting the generators.
+        this._routerEntries = [];
+
         events.on('router.created', (router) => {
             if (router.name !== 'StaticRoutesRouter' && router.name !== 'CollectionRouter') {
                 return;
@@ -29,9 +60,30 @@ class SiteMapManager {
                 url: router.getRoute({absolute: true}),
                 datum: {id: router.identifier, staticRoute: router.name === 'StaticRoutesRouter'}
             };
+            this._routerEntries.push(entry);
             this.pages.addUrl(entry.url, entry.datum);
+            // A router registering after a build (routes reload re-registers
+            // them one macrotask after routers.reset) must not leave a
+            // zero-router index marked built — the CDN would pin it.
+            if (this._getUrlService().hasLazyBackend()) {
+                this._invalidateIndex();
+            }
         });
 
+        // With only the eager URL service, its per-URL feed below keeps the
+        // index current after the initial build, so site changes need no
+        // rebuild. A lazy backend fires no such events (lazy mode) or is
+        // being soaked per cycle (compare mode), so there the index empties
+        // and the next read rebuilds.
+        events.on('site.changed', () => {
+            if (this._getUrlService().hasLazyBackend()) {
+                this._invalidateIndex();
+            }
+        });
+
+        // The eager URL service's per-URL feed. Under pure lazy these events
+        // never fire; in compare mode they are redundant with (and consistent
+        // with) the rebuilds, since both derive from the same eager cache.
         DomainEvents.subscribe(URLResourceUpdatedEvent, (event) => {
             this[event.data.resourceType].updateURL(event.data);
         });
@@ -49,6 +101,12 @@ class SiteMapManager {
             this.posts && this.posts.reset();
             this.users && this.users.reset();
             this.tags && this.tags.reset();
+            // The routers re-register right after a reset and refill the
+            // list; keeping stale entries would resurrect deleted routes.
+            this._routerEntries = [];
+            if (this._getUrlService().hasLazyBackend()) {
+                this._invalidateIndex();
+            }
         });
     }
 
@@ -80,12 +138,108 @@ class SiteMapManager {
         return new TagsMapGenerator(options);
     }
 
-    getIndexXml() {
+    async getIndexXml() {
+        await this._ensureIndexReady();
         return this.index.getXml();
     }
 
-    getSiteMapXml(type, page) {
+    async getSiteMapXml(type, page) {
+        await this._ensureIndexReady();
         return this[type].getXml(page);
+    }
+
+    /**
+     * Make sure the index is ready to serve; every XML read awaits this, so
+     * no caller can render from an unbuilt index. The index is built once on
+     * first read in every mode. With the eager URL service the per-URL
+     * events keep it current from then on (and heal any gap in the initial
+     * snapshot, since addUrl is id-keyed); with a lazy backend the
+     * invalidation signals empty it and the next read rebuilds.
+     *
+     * Concurrent readers share one build. A build whose result was
+     * invalidated while it ran is discarded and the read fails — the index
+     * must never serve pre-invalidation data (the CDN would pin it for the
+     * full cache maxAge), and a 503 is retried by crawlers and stored by
+     * nobody. Unreachable with eager (nothing invalidates), and
+     * deliberately no retry; if SITEMAP_BUILD_SUPERSEDED shows up in the
+     * logs at any rate worth caring about, add one then.
+     */
+    async _ensureIndexReady() {
+        if (this._indexBuilt) {
+            return;
+        }
+        if (!this._buildInFlight) {
+            this._buildInFlight = this._buildIndex().finally(() => {
+                this._buildInFlight = null;
+            });
+        }
+        await this._buildInFlight;
+
+        if (!this._indexBuilt) {
+            throw new errors.MaintenanceError({
+                message: 'Sitemap index build was invalidated by a concurrent site change',
+                code: 'SITEMAP_BUILD_SUPERSEDED'
+            });
+        }
+    }
+
+    async _buildIndex() {
+        const epoch = this._indexEpoch;
+        const urlService = this._getUrlService();
+        const fetch = type => urlService.getRoutableResources(type, {columns: SITEMAP_COLUMNS});
+
+        const [posts, pages, tags, authors] = await Promise.all(
+            [fetch('posts'), fetch('pages'), fetch('tags'), fetch('authors')]
+        );
+        const resources = {posts, pages, tags, authors};
+
+        if (epoch !== this._indexEpoch) {
+            // Invalidated while fetching: leave the generators alone and let
+            // _ensureIndexReady start over.
+            return;
+        }
+        // Everything from here on is synchronous, so no request can observe
+        // a half-applied index.
+        this.posts.reset();
+        this.pages.reset();
+        this.tags.reset();
+        this.users.reset();
+        for (const entry of this._routerEntries) {
+            this.pages.addUrl(entry.url, entry.datum);
+        }
+        for (const type of ['posts', 'pages', 'tags', 'authors']) {
+            for (const datum of resources[type]) {
+                this._applyResource(type, datum);
+            }
+        }
+        this._indexBuilt = true;
+    }
+
+    _invalidateIndex() {
+        this._indexBuilt = false;
+        this._indexEpoch += 1;
+    }
+
+    /**
+     * Add a single resource to the index.
+     */
+    _applyResource(type, datum) {
+        // skipComparison: teeing every bulk row through the compare machinery
+        // would capture a stack and queue a background lazy computation per
+        // resource, per rebuild. Enumeration parity comes from the
+        // getRoutableResources id-set comparison; per-URL parity from
+        // organic request traffic.
+        const url = this._getUrlService().getUrlForResource({...datum, type}, {absolute: true, skipComparison: true});
+        if (url && !url.includes('/404/')) {
+            this[type].addUrl(url, datum);
+        }
+    }
+
+    _getUrlService() {
+        if (!this._urlService) {
+            this._urlService = require('../proxy').urlService.facade;
+        }
+        return this._urlService;
     }
 }
 
