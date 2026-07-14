@@ -6,7 +6,7 @@ const errors = require('@tryghost/errors');
 /**
  * @typedef {object} FetchData
  * @property {boolean} running
- * @property {('email-analytics-latest-others'|'email-analytics-missing'|'email-analytics-latest-opened'|'email-analytics-scheduled')} jobName Name of the job that is running
+ * @property {string} jobName Name of the job that is running
  * @property {Date} [lastStarted] Date the last fetch started on
  * @property {Date} [lastBegin] The begin time used during the last fetch
  * @property {Date} [lastEventTimestamp]
@@ -19,6 +19,26 @@ const errors = require('@tryghost/errors');
 
 /**
  * @typedef {'delivered' | 'opened' | 'failed' | 'unsubscribed' | 'complained'} EmailAnalyticsEvent
+ */
+
+/**
+ * Names of the jobs this service runs. Each pipeline needs its own set so their
+ * cursors don't overwrite each other in the jobs table.
+ *
+ * @typedef {object} JobNames
+ * @property {string} latestNonOpened
+ * @property {string} missing
+ * @property {string} latestOpened
+ * @property {string} scheduled
+ */
+
+/**
+ * Recipient table and timestamp columns used to seed a job's cursor the first
+ * time it runs, before there's any job data to resume from.
+ *
+ * @typedef {object} CursorSeed
+ * @prop {string} tableName
+ * @prop {Partial<Record<EmailAnalyticsEvent, string>>} eventColumns
  */
 
 /**
@@ -56,37 +76,28 @@ module.exports = class EmailAnalyticsService {
     provider;
     #createEventProcessor;
 
-    /**
-     * @type {FetchData}
-     */
-    #fetchLatestNonOpenedData = {
-        running: false,
-        jobName: 'email-analytics-latest-others'
-    };
+    /** @type {JobNames} */ #jobNames;
+    /** @type {CursorSeed} */ #cursorSeed;
 
     /**
      * @type {FetchData}
      */
-    #fetchMissingData = {
-        running: false,
-        jobName: 'email-analytics-missing'
-    };
+    #fetchLatestNonOpenedData;
 
     /**
      * @type {FetchData}
      */
-    #fetchLatestOpenedData = {
-        running: false,
-        jobName: 'email-analytics-latest-opened'
-    };
+    #fetchMissingData;
+
+    /**
+     * @type {FetchData}
+     */
+    #fetchLatestOpenedData;
 
     /**
      * @type {FetchDataScheduled}
      */
-    #fetchScheduledData = {
-        running: false,
-        jobName: 'email-analytics-scheduled'
-    };
+    #fetchScheduledData;
 
     /**
      * @param {object} dependencies
@@ -94,12 +105,33 @@ module.exports = class EmailAnalyticsService {
      * @param {object} dependencies.provider
      * @param {import('@tryghost/prometheus-metrics')} dependencies.prometheusClient
      * @param {() => EventProcessor} dependencies.createEventProcessor
+     * @param {JobNames} dependencies.jobNames
+     * @param {CursorSeed} dependencies.cursorSeed
      */
-    constructor({queries, provider, prometheusClient, createEventProcessor}) {
+    constructor({queries, provider, prometheusClient, createEventProcessor, jobNames, cursorSeed}) {
         this.queries = queries;
         this.provider = provider;
         this.prometheusClient = prometheusClient;
         this.#createEventProcessor = createEventProcessor;
+        this.#jobNames = jobNames;
+        this.#cursorSeed = cursorSeed;
+
+        this.#fetchLatestNonOpenedData = {
+            running: false,
+            jobName: jobNames.latestNonOpened
+        };
+        this.#fetchMissingData = {
+            running: false,
+            jobName: jobNames.missing
+        };
+        this.#fetchLatestOpenedData = {
+            running: false,
+            jobName: jobNames.latestOpened
+        };
+        this.#fetchScheduledData = {
+            running: false,
+            jobName: jobNames.scheduled
+        };
 
         if (prometheusClient) {
             // @ts-expect-error
@@ -110,9 +142,9 @@ module.exports = class EmailAnalyticsService {
     #clearScheduledData() {
         this.#fetchScheduledData = {
             running: false,
-            jobName: 'email-analytics-scheduled'
+            jobName: this.#jobNames.scheduled
         };
-        this.queries.setJobMetadata('email-analytics-scheduled', null);
+        this.queries.setJobMetadata(this.#jobNames.scheduled, null);
     }
 
     getStatus() {
@@ -128,14 +160,14 @@ module.exports = class EmailAnalyticsService {
      * Returns the timestamp of the last non-opened event we processed. Defaults to now minus 30 minutes if we have no data yet.
      */
     async getLastNonOpenedEventTimestamp() {
-        return this.#fetchLatestNonOpenedData?.lastEventTimestamp ?? (await this.queries.getLastEventTimestamp(this.#fetchLatestNonOpenedData.jobName,['delivered','failed'])) ?? new Date(Date.now() - TRUST_THRESHOLD_MS);
+        return this.#fetchLatestNonOpenedData?.lastEventTimestamp ?? (await this.queries.getLastEventTimestamp(this.#fetchLatestNonOpenedData.jobName, ['delivered', 'failed'], this.#cursorSeed)) ?? new Date(Date.now() - TRUST_THRESHOLD_MS);
     }
 
     /**
      * Returns the timestamp of the last opened event we processed. Defaults to now minus 30 minutes if we have no data yet.
      */
     async getLastOpenedEventTimestamp() {
-        return this.#fetchLatestOpenedData?.lastEventTimestamp ?? (await this.queries.getLastEventTimestamp(this.#fetchLatestOpenedData.jobName,['opened'])) ?? new Date(Date.now() - TRUST_THRESHOLD_MS);
+        return this.#fetchLatestOpenedData?.lastEventTimestamp ?? (await this.queries.getLastEventTimestamp(this.#fetchLatestOpenedData.jobName, ['opened'], this.#cursorSeed)) ?? new Date(Date.now() - TRUST_THRESHOLD_MS);
     }
 
     /**
@@ -225,13 +257,13 @@ module.exports = class EmailAnalyticsService {
         logging.info('[EmailAnalytics] Scheduling fetch from ' + begin.toISOString() + ' until ' + end.toISOString());
         this.#fetchScheduledData = {
             running: false,
-            jobName: 'email-analytics-scheduled',
+            jobName: this.#jobNames.scheduled,
             schedule: {
                 begin,
                 end
             }
         };
-        await this.queries.setJobMetadata('email-analytics-scheduled', {
+        await this.queries.setJobMetadata(this.#jobNames.scheduled, {
             begin: begin.toISOString(),
             end: end.toISOString()
         });
@@ -248,7 +280,7 @@ module.exports = class EmailAnalyticsService {
             if (this.#fetchScheduledData.running) {
                 this.#fetchScheduledData.canceled = true;
                 // Clear metadata eagerly; fetchScheduled() will clear in-memory state next cycle
-                this.queries.setJobMetadata('email-analytics-scheduled', null);
+                this.queries.setJobMetadata(this.#jobNames.scheduled, null);
             } else {
                 this.#clearScheduledData();
             }
@@ -261,7 +293,7 @@ module.exports = class EmailAnalyticsService {
      */
     async restoreScheduled() {
         try {
-            const jobData = await this.queries.getJobData('email-analytics-scheduled');
+            const jobData = await this.queries.getJobData(this.#jobNames.scheduled);
             if (!jobData || !jobData.metadata) {
                 return;
             }
@@ -273,7 +305,7 @@ module.exports = class EmailAnalyticsService {
 
                 this.#fetchScheduledData = {
                     running: false,
-                    jobName: 'email-analytics-scheduled',
+                    jobName: this.#jobNames.scheduled,
                     schedule: {begin, end}
                 };
 
